@@ -1,0 +1,9 @@
+streamlit>=1.59
+plotly>=6.9
+shap>=0.52
+lime
+lightgbm
+scikit-learn
+pandas
+numpy
+joblib
