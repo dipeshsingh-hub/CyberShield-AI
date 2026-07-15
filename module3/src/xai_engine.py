@@ -228,9 +228,74 @@ def get_dependence_data(feature: str) -> pd.DataFrame:
     })
 
 
-def generate_xai_report(row_index: int = None) -> dict:
+def explain_live_event(feature_vector: dict, anomaly_score: float, phishing_probability: float,
+                        final_risk_probability: float, risk_category: str) -> dict:
+    """
+    NEW capability (added for Module 4's live orchestration — does not rename
+    or alter any existing Module 3 export). Computes a local SHAP explanation
+    for an ARBITRARY new event that is NOT a row in the static
+    unified_threat_data.csv dataset — e.g. a live event just scored by
+    Module 1 + Module 2 in main.py's real-time pipeline.
+
+    No retraining needed: shap.TreeExplainer scores any new instance through
+    the already-trained surrogate model instantly, exactly like calling
+    predict_proba on a new row.
+
+    Args:
+        feature_vector: dict with the 8 Module-1 processed_features keys
+            (rolling_packet_mean, packet_std, packet_entropy, traffic_ratio,
+            connection_density, request_ratio, burst_score, failed_connection_rate).
+            Raw packet_size/burst_frequency/dns_requests are optional — if
+            absent, filled with the training dataset's median (documented
+            degraded-precision fallback, mirroring Module 1's own approach
+            to missing rolling-feature context).
+        anomaly_score, phishing_probability, final_risk_probability, risk_category:
+            already-computed upstream values, passed through into risk_summary.
+
+    Returns: same shape as generate_xai_report()'s local-report branch.
+    """
+    _ensure_surrogate_loaded()
+    df = load_dataset()
+
+    row_values = []
+    for col in SURROGATE_FEATURE_COLS:
+        if col in feature_vector and feature_vector[col] is not None:
+            row_values.append(float(feature_vector[col]))
+        else:
+            fallback = float(df[col].median())
+            logger.warning(f"explain_live_event: '{col}' missing from feature_vector, using dataset median {fallback:.4f}")
+            row_values.append(fallback)
+
+    X_live = np.array(row_values).reshape(1, -1)
+    shap_row = _explainer.shap_values(X_live)
+    if isinstance(shap_row, list):
+        shap_row = shap_row[1]
+    shap_row = shap_row[0]
+
+    local = pd.DataFrame({
+        "feature": SURROGATE_FEATURE_COLS,
+        "value": row_values,
+        "shap_value": shap_row,
+    }).sort_values("shap_value", key=abs, ascending=False).reset_index(drop=True)
+
+    return {
+        "important_features": local["feature"].tolist(),
+        "feature_contributions": dict(zip(local["feature"], local["shap_value"].astype(float))),
+        "risk_summary": {
+            "anomaly_score": float(anomaly_score),
+            "phishing_probability": float(phishing_probability),
+            "final_risk_probability": float(final_risk_probability),
+            "risk_category": risk_category,
+        },
+    }
+
+
+def generate_xai_report(row_index: int = None, live_event: dict = None) -> dict:
     """
     PUBLIC CONTRACT (do not rename): generate_xai_report(row_index=None)
+    EXTENDED (not renamed) with an optional `live_event` parameter so
+    Module 4's real-time orchestrator can get an explanation for a brand new
+    event that was never part of the static dashboard dataset.
 
     Returns:
         {
@@ -239,13 +304,22 @@ def generate_xai_report(row_index: int = None) -> dict:
             "risk_summary": {...},
         }
 
-    If row_index is given: a LOCAL report for that specific row —
+    Exactly one of row_index / live_event should be given, or neither for
+    the global dataset-wide report. If both are given, live_event takes
+    precedence (documented, not silent) since it's the more specific request.
+
+    If live_event is given: a LOCAL report for a NEW event not in the
+        static dataset — see explain_live_event() for the expected dict shape:
+        {"feature_vector": {...}, "anomaly_score": ..., "phishing_probability": ...,
+         "final_risk_probability": ..., "risk_category": ...}
+
+    If row_index is given: a LOCAL report for that specific EXISTING row —
         important_features: that row's top features ranked by |SHAP value|
         feature_contributions: {feature: shap_value} for that row
         risk_summary: that row's anomaly_score / phishing_probability /
             final_risk_probability / risk_category
 
-    If row_index is None: a GLOBAL report over the whole dataset —
+    If neither is given: a GLOBAL report over the whole dataset —
         important_features: dataset-wide top features ranked by mean |SHAP value|
         feature_contributions: {feature: mean_shap_value} across the dataset
             (signed mean, not mean absolute — shows each feature's average
@@ -254,6 +328,15 @@ def generate_xai_report(row_index: int = None) -> dict:
     """
     _ensure_surrogate_loaded()
     df = load_dataset()
+
+    if live_event is not None:
+        return explain_live_event(
+            feature_vector=live_event.get("feature_vector", {}),
+            anomaly_score=live_event.get("anomaly_score", 0.0),
+            phishing_probability=live_event.get("phishing_probability", 0.0),
+            final_risk_probability=live_event.get("final_risk_probability", 0.0),
+            risk_category=live_event.get("risk_category", "Unknown"),
+        )
 
     if row_index is not None:
         local = get_local_shap_values(row_index)
