@@ -24,7 +24,10 @@ module1/
 │   ├── feature_engineering.py         # -> processed_features
 │   ├── anomaly_detector.py            # AnomalyEnsemble -> trained_models, anomaly_score
 │   ├── train.py                       # orchestrates the full training pipeline
-│   └── predict.py                     # -> predict_network_anomaly(df)
+│   ├── predict.py                     # -> predict_network_anomaly(df)
+│   ├── cross_validate.py              # 5-fold stratified CV (mean +/- std AUC/F1)
+│   ├── stress_test.py                 # harder held-out eval (stealthy attacks + noisy normal)
+│   └── baseline_module1.py            # single-feature triviality diagnosis
 └── README.md
 ```
 
@@ -32,8 +35,10 @@ module1/
 
 ```bash
 cd module1/src
-python train.py     # generates data if missing, trains both models, evaluates, saves artifacts
-python predict.py    # smoke test against 5 sample rows
+python train.py            # generates data if missing, trains both models, evaluates, saves artifacts
+python predict.py          # smoke test against 5 sample rows
+python cross_validate.py   # 5-fold stratified CV, mean +/- std AUC/F1
+python stress_test.py      # separate, harder held-out evaluation (requires train.py to have run first)
 ```
 
 ## Public contract (do not rename — later modules import these)
@@ -47,14 +52,86 @@ python predict.py    # smoke test against 5 sample rows
 
 ## Actual measured results (test split, 25% holdout, stratified)
 
-- **ROC AUC: 0.999**
-- **Precision: 0.923, Recall: 0.963, F1: 0.943** at the F1-optimal threshold (~39, found by sweeping thresholds on the *train* split — never on test, to avoid leakage)
+- **ROC AUC: 0.8086**
+- **Precision: 0.2268, Recall: 0.3600, F1: 0.2783** at the F1-optimal threshold (37.0, found by sweeping thresholds on the *train* split — never on test, to avoid leakage)
 - Confusion matrix, ROC curve, and permutation feature importance are saved as PNGs in `evaluation/`
+
+**A note on why these numbers are lower than earlier versions of this
+README claimed (0.999 AUC / 0.923 precision / 0.963 recall / 0.943 F1):**
+those figures were measured against an earlier version of
+`generate_data.py`, before the "geographic risk stratification" and
+"3-tier attack sophistication" commits (see `git log -- src/generate_data.py`)
+added stealthy/low-and-slow attack variants and a "noisy normal" traffic
+sub-population that overlaps with them in feature space. That data change
+was never followed by a re-measurement, so the README kept quoting stale
+numbers. Re-running `train.py` against the current generator reproduces
+0.8086 AUC consistently (verified across repeated runs and across a
+contamination sweep from 0.03–0.2, which stayed in the 0.80–0.81 band —
+this is not a bad random seed or an un-tuned hyperparameter, it's the
+current honest ceiling for an unsupervised IsolationForest+OneClassSVM
+ensemble against this harder data). See the stress-test and cross-validation
+sections below for the fuller picture, including a scenario where this
+ensemble's ranking is actively fooled.
 
 These numbers are real, not aspirational — every claim above was verified by
 actually running the pipeline, not estimated. Some of it took fixing bugs
 along the way (see "Known issues found and fixed" below), which is a more
 honest state to hand off than a first-draft script nobody ran.
+
+## 5-fold cross-validation (`cross_validate.py`)
+
+Stratified 5-fold CV on the full 32,000-row dataset, refitting the ensemble
+per fold (F1-optimal threshold swept on each fold's training data, never on
+its held-out fold):
+
+| Fold | AUC | F1 | Threshold |
+|---|---|---|---|
+| 1 | 0.7997 | 0.2697 | 40.0 |
+| 2 | 0.8191 | 0.2831 | 39.0 |
+| 3 | 0.8024 | 0.2766 | 41.0 |
+| 4 | 0.7875 | 0.2600 | 39.0 |
+| 5 | 0.8029 | 0.2430 | 40.0 |
+
+**Mean AUC: 0.8023 ± 0.0101 · Mean F1: 0.2665 ± 0.0140**
+
+Tight spread across folds — the ~0.80 AUC is a stable characteristic of this
+model/data combination, not a lucky (or unlucky) single split.
+
+## Stress-test / harder-holdout results (`stress_test.py`)
+
+The main split above draws attacks from generate_data.py's blended mix (35%
+obvious / 40% moderate / 25% stealthy per archetype) and normal traffic from
+its blended mix (70% standard / 15% bursty / 15% "noisy"). `stress_test.py`
+builds a **separate, held-out 8,000-row sample** (different random seed) that
+uses *only* the stealthy/low-and-slow tier for every attack archetype, and
+*only* the "noisy normal" sub-population (elevated failed-connections,
+network-drop/retry-like traffic) for benign rows — using the exact same
+statistical parameters already in `generate_data.py`, just selecting the
+hardest slice of each instead of the blended mix.
+
+```
+STRESS-TEST ROC AUC: 0.1836
+At deployed threshold (37.0): Precision=0.0137, Recall=0.1050, F1=0.0242
+Stress-set-optimal threshold=1.0: F1=0.0952
+```
+
+**This is a real, and fairly stark, negative result, reported as-is:** an AUC
+below 0.5 means the ensemble's ranking is *inverted* on this slice — stealthy
+attacks score lower, on average, than noisy-but-benign traffic. The reason is
+visible in the generator parameters themselves: the "noisy normal" block
+was designed with elevated `failed_connections` (Poisson mean 6, clipped
+1–20) to simulate network drops/retries, while the stealthy attack tiers
+were designed to look calm (e.g. stealthy brute-force uses `failed_connections`
+Poisson mean 2.5, clipped 0–8; stealthy port-scan uses Poisson mean 2.0,
+clipped 0–6) — so on this feature alone, "noisy normal" looks more
+suspicious than a stealthy attack. In other words: the two "hard" sub-populations
+that make each side of the dataset harder in isolation also happen to point
+the anomaly-score ranking in the wrong direction when combined. This is a
+genuine limitation of an 8-feature, unsupervised ensemble, not a
+measurement error — repeated runs reproduce it. It's the clearest evidence
+in this repo that "no data leakage" and "will detect stealthy real-world
+attacks" are different claims; see the top-level README's new section on
+this distinction.
 
 ## Feature importance (permutation, AUC-drop based)
 
@@ -107,7 +184,10 @@ touching the top 4.
    every downstream consumer that maps predictions back to specific log
    rows. Fixed by tagging each row with its original position before
    sorting and restoring that order before returning. Verified by comparing
-   AUC before/after on shuffled and contiguous batches (0.52 → 0.999).
+   AUC before/after on shuffled and contiguous batches (0.52 → 0.999 at the
+   time this bug was fixed — against an earlier, easier version of
+   `generate_data.py`; see the "Actual measured results" section above for
+   why the current headline AUC is 0.8086, not 0.999).
 
 ## Operational caveat for real deployment
 
